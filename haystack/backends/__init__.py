@@ -2,37 +2,16 @@
 from copy import deepcopy
 from time import time
 from django.conf import settings
-from django.core import signals
 from django.db.models import Q
 from django.db.models.base import ModelBase
 from django.utils import tree
 from django.utils.encoding import force_unicode
-from haystack.constants import DJANGO_CT, VALID_FILTERS, FILTER_SEPARATOR
-from haystack.exceptions import SearchBackendError, MoreLikeThisError, FacetingError
+from haystack.constants import VALID_FILTERS, FILTER_SEPARATOR, DEFAULT_ALIAS
+from haystack.exceptions import MoreLikeThisError, FacetingError
 from haystack.models import SearchResult
-try:
-    from django.utils import importlib
-except ImportError:
-    from haystack.utils import importlib
-
+from haystack.utils.loading import UnifiedIndex
 
 VALID_GAPS = ['year', 'month', 'day', 'hour', 'minute', 'second']
-
-
-# A means to inspect all search queries that have run in the last request.
-queries = []
-
-
-# Per-request, reset the ghetto query log.
-# Probably not extraordinarily thread-safe but should only matter when
-# DEBUG = True.
-def reset_search_queries(**kwargs):
-    global queries
-    queries = []
-
-
-if settings.DEBUG:
-    signals.request_started.connect(reset_search_queries)
 
 
 def log_query(func):
@@ -49,12 +28,14 @@ def log_query(func):
             stop = time()
 
             if settings.DEBUG:
-                global queries
-                queries.append({
+                from haystack import connections
+                connections[obj.connection_alias].queries.append({
                     'query_string': query_string,
                     'additional_args': args,
                     'additional_kwargs': kwargs,
                     'time': "%.3f" % (stop - start),
+                    'start': start,
+                    'stop': stop,
                 })
 
     return wrapper
@@ -82,14 +63,13 @@ class BaseSearchBackend(object):
     RESERVED_WORDS = []
     RESERVED_CHARACTERS = []
 
-    def __init__(self, site=None):
-        if site is not None:
-            self.site = site
-        else:
-            from haystack import site
-            self.site = site
-
-        self.silently_fail = getattr(settings, 'HAYSTACK_SILENTLY_FAIL', True)
+    def __init__(self, connection_alias, **connection_options):
+        self.connection_alias = connection_alias
+        self.timeout = connection_options.get('TIMEOUT', 10)
+        self.include_spelling = connection_options.get('INCLUDE_SPELLING', False)
+        self.batch_size = connection_options.get('BATCH_SIZE', 1000)
+        self.silently_fail = connection_options.get('SILENTLY_FAIL', True)
+        self.distance_available = connection_options.get('DISTANCE_AVAILABLE', False)
 
     def update(self, index, iterable):
         """
@@ -122,10 +102,7 @@ class BaseSearchBackend(object):
         raise NotImplementedError
 
     @log_query
-    def search(self, query_string, sort_by=None, start_offset=0, end_offset=None,
-               fields='', highlight=False, facets=None, date_facets=None, query_facets=None,
-               narrow_queries=None, spelling_query=None,
-               limit_to_registered_models=None, result_class=None, **kwargs):
+    def search(self, query_string, **kwargs):
         """
         Takes a query to search on and returns dictionary.
 
@@ -139,6 +116,17 @@ class BaseSearchBackend(object):
         This method MUST be implemented by each backend, as it will be highly
         specific to each one.
         """
+        raise NotImplementedError
+
+    def build_search_kwargs(self, query_string, sort_by=None, start_offset=0, end_offset=None,
+                            fields='', highlight=False, facets=None, facet_options=None,
+                            date_facets=None, query_facets=None,
+                            narrow_queries=None, spelling_query=None,
+                            within=None, dwithin=None, distance_point=None,
+                            models=None, limit_to_registered_models=None,
+                            result_class=None):
+        # A convenience method most backends should include in order to make
+        # extension easier.
         raise NotImplementedError
 
     def prep_value(self, value):
@@ -157,6 +145,23 @@ class BaseSearchBackend(object):
         """
         raise NotImplementedError("Subclasses must provide a way to fetch similar record via the 'more_like_this' method if supported by the backend.")
 
+    def extract_file_contents(self, file_obj):
+        """
+        Hook to allow backends which support rich-content types such as PDF,
+        Word, etc. extraction to process the provided file object and return
+        the contents for indexing
+
+        Returns None if metadata cannot be extracted; otherwise returns a
+        dictionary containing at least two keys:
+
+            :contents:
+                        Extracted full-text content, if applicable
+            :metadata:
+                        key:value pairs of text strings
+        """
+
+        raise NotImplementedError("Subclasses must provide a way to extract metadata via the 'extract' method if supported by the backend.")
+
     def build_schema(self, fields):
         """
         Takes a dictionary of fields and returns schema information.
@@ -166,18 +171,19 @@ class BaseSearchBackend(object):
         """
         raise NotImplementedError("Subclasses must provide a way to build their schema.")
 
-    def build_registered_models_list(self):
+    def build_models_list(self):
         """
-        Builds a list of registered models for searching.
+        Builds a list of models for searching.
 
         The ``search`` method should use this and the ``django_ct`` field to
         narrow the results (unless the user indicates not to). This helps ignore
-        any results that are not currently registered models and ensures
+        any results that are not currently handled models and ensures
         consistent caching.
         """
+        from haystack import connections
         models = []
 
-        for model in self.site.get_indexed_models():
+        for model in connections[self.connection_alias].get_unified_index().get_indexed_models():
             models.append(u"%s.%s" % (model._meta.app_label, model._meta.module_name))
 
         return models
@@ -206,7 +212,7 @@ class SearchNode(tree.Node):
         return '<SQ: %s %s>' % (self.connector, self.as_query_string(self._repr_query_fragment_callback))
 
     def _repr_query_fragment_callback(self, field, filter_type, value):
-        return '%s%s%s=%s' % (field, FILTER_SEPARATOR, filter_type, force_unicode(value).encode('utf8'))
+        return "%s%s%s=%s" % (field, FILTER_SEPARATOR, filter_type, force_unicode(value).encode('utf8'))
 
     def as_query_string(self, query_fragment_callback):
         """
@@ -240,7 +246,7 @@ class SearchNode(tree.Node):
         field = parts[0]
 
         if len(parts) == 1 or parts[-1] not in VALID_FILTERS:
-            filter_type = 'exact'
+            filter_type = 'contains'
         else:
             filter_type = parts.pop()
 
@@ -277,7 +283,7 @@ class BaseSearchQuery(object):
     implementation.
     """
 
-    def __init__(self, site=None, backend=None):
+    def __init__(self, using=DEFAULT_ALIAS):
         self.query_filter = SearchNode()
         self.order_by = []
         self.models = set()
@@ -286,6 +292,7 @@ class BaseSearchQuery(object):
         self.end_offset = None
         self.highlight = False
         self.facets = set()
+        self.facet_options = {}
         self.date_facets = {}
         self.query_facets = []
         self.narrow_queries = set()
@@ -294,6 +301,11 @@ class BaseSearchQuery(object):
         #: and django_id when using code which expects those to be included in
         #: the results
         self.fields = []
+        # Geospatial-related information
+        self.within = {}
+        self.dwithin = {}
+        self.distance_point = {}
+        # Internal.
         self._raw_query = None
         self._raw_query_params = {}
         self._more_like_this = False
@@ -304,10 +316,9 @@ class BaseSearchQuery(object):
         self._spelling_suggestion = None
         self.result_class = SearchResult
 
-        if backend is not None:
-            self.backend = backend
-        else:
-            self.backend = SearchBackend(site=site)
+        from haystack import connections
+        self._using = using
+        self.backend = connections[self._using].get_backend()
 
     def __str__(self):
         return self.build_query()
@@ -316,23 +327,13 @@ class BaseSearchQuery(object):
         """For pickling."""
         obj_dict = self.__dict__.copy()
         del(obj_dict['backend'])
-
-        # Rip off the class bits as we'll be using this path when we go to load
-        # the backend.
-        obj_dict['backend_used'] = ".".join(str(self.backend).replace("<", "").split(".")[0:-1])
         return obj_dict
 
     def __setstate__(self, obj_dict):
         """For unpickling."""
-        backend_used = obj_dict.pop('backend_used')
+        from haystack import connections
         self.__dict__.update(obj_dict)
-
-        try:
-            loaded_backend = importlib.import_module(backend_used)
-        except ImportError:
-            raise SearchBackendError("The backend this query was pickled with '%s.SearchBackend' could not be loaded." % backend_used)
-
-        self.backend = loaded_backend.SearchBackend()
+        self.backend = connections[self._using].get_backend()
 
     def has_run(self):
         """Indicates if any query has been been run."""
@@ -356,6 +357,9 @@ class BaseSearchQuery(object):
         if self.facets:
             kwargs['facets'] = list(self.facets)
 
+        if self.facet_options:
+            kwargs['facet_options'] = self.facet_options
+            
         if self.date_facets:
             kwargs['date_facets'] = self.date_facets
 
@@ -371,11 +375,23 @@ class BaseSearchQuery(object):
         if self.boost:
             kwargs['boost'] = self.boost
 
+        if self.within:
+            kwargs['within'] = self.within
+
+        if self.dwithin:
+            kwargs['dwithin'] = self.dwithin
+
+        if self.distance_point:
+            kwargs['distance_point'] = self.distance_point
+
         if self.result_class:
             kwargs['result_class'] = self.result_class
 
         if self.fields:
             kwargs['fields'] = self.fields
+
+        if self.models:
+            kwargs['models'] = self.models
 
         return kwargs
 
@@ -404,6 +420,9 @@ class BaseSearchQuery(object):
         search_kwargs = {
             'result_class': self.result_class,
         }
+
+        if self.models:
+            search_kwargs['models'] = self.models
 
         if kwargs:
             search_kwargs.update(kwargs)
@@ -507,22 +526,11 @@ class BaseSearchQuery(object):
         Interprets the collected query metadata and builds the final query to
         be sent to the backend.
         """
-        query = self.query_filter.as_query_string(self.build_query_fragment)
+        final_query = self.query_filter.as_query_string(self.build_query_fragment)
 
-        if not query:
+        if not final_query:
             # Match all.
-            query = self.matching_all_fragment()
-
-        if len(self.models):
-            models = sorted(['%s:%s.%s' % (DJANGO_CT, model._meta.app_label, model._meta.module_name) for model in self.models])
-            models_clause = ' OR '.join(models)
-
-            if query != self.matching_all_fragment():
-                final_query = '(%s) AND (%s)' % (query, models_clause)
-            else:
-                final_query = models_clause
-        else:
-            final_query = query
+            final_query = self.matching_all_fragment()
 
         if self.boost:
             boost_list = []
@@ -560,6 +568,9 @@ class BaseSearchQuery(object):
 
         A basic (override-able) implementation is provided.
         """
+        if not isinstance(query_fragment, basestring):
+            return query_fragment
+
         words = query_fragment.split()
         cleaned_words = []
 
@@ -574,17 +585,25 @@ class BaseSearchQuery(object):
 
         return ' '.join(cleaned_words)
 
+    def build_not_query(self, query_string):
+        if ' ' in query_string:
+            query_string = "(%s)" % query_string
+
+        return u"NOT %s" % query_string
+
+    def build_exact_query(self, query_string):
+        return u'"%s"' % query_string
+
     def add_filter(self, query_filter, use_or=False):
         """
         Adds a SQ to the current query.
         """
-        # TODO: consider supporting add_to_query callbacks on q objects
         if use_or:
             connector = SQ.OR
         else:
             connector = SQ.AND
 
-        if self.query_filter and query_filter.connector != SQ.AND and len(query_filter) > 1:
+        if self.query_filter and query_filter.connector != connector and len(query_filter) > 1:
             self.query_filter.start_subtree(connector)
             subtree = True
         else:
@@ -611,12 +630,23 @@ class BaseSearchQuery(object):
         """Orders the search result by a field."""
         self.order_by.append(field)
 
+    def add_order_by_distance(self, **kwargs):
+        """Orders the search result by distance from point."""
+        raise NotImplementedError("Subclasses must provide a way to add order by distance in the 'add_order_by_distance' method.")
+
     def clear_order_by(self):
         """
         Clears out all ordering that has been already added, reverting the
         query to relevancy.
         """
         self.order_by = []
+
+    def clear_order_by_distance(self):
+        """
+        Clears out all distance ordering that has been already added, reverting the
+        query to relevancy.
+        """
+        self.order_by_distance = []
 
     def add_model(self, model):
         """
@@ -671,12 +701,45 @@ class BaseSearchQuery(object):
         """Adds highlighting to the search results."""
         self.highlight = True
 
-    def add_field_facet(self, field):
+    def add_within(self, field, point_1, point_2):
+        """Adds bounding box parameters to search query."""
+        from haystack.utils.geo import ensure_point
+        self.within = {
+            'field': field,
+            'point_1': ensure_point(point_1),
+            'point_2': ensure_point(point_2),
+        }
+
+    def add_dwithin(self, field, point, distance):
+        """Adds radius-based parameters to search query."""
+        from haystack.utils.geo import ensure_point, ensure_distance
+        self.dwithin = {
+            'field': field,
+            'point': ensure_point(point),
+            'distance': ensure_distance(distance),
+        }
+
+    def add_distance(self, field, point):
+        """
+        Denotes that results should include distance measurements from the
+        point passed in.
+        """
+        from haystack.utils.geo import ensure_point
+        self.distance_point = {
+            'field': field,
+            'point': ensure_point(point),
+        }
+
+    def add_field_facet(self, field, options):
         """Adds a regular facet on a field."""
-        self.facets.add(self.backend.site.get_facet_field_name(field))
+        from haystack import connections
+        f = connections[self._using].get_unified_index().get_facet_fieldname(field)
+        self.facets.add(f)
+        self.facet_options[f] = options
 
     def add_date_facet(self, field, start_date, end_date, gap_by, gap_amount=1):
         """Adds a date-based facet on a field."""
+        from haystack import connections
         if not gap_by in VALID_GAPS:
             raise FacetingError("The gap_by ('%s') must be one of the following: %s." % (gap_by, ', '.join(VALID_GAPS)))
 
@@ -686,11 +749,12 @@ class BaseSearchQuery(object):
             'gap_by': gap_by,
             'gap_amount': gap_amount,
         }
-        self.date_facets[self.backend.site.get_facet_field_name(field)] = details
+        self.date_facets[connections[self._using].get_unified_index().get_facet_fieldname(field)] = details
 
     def add_query_facet(self, field, query):
         """Adds a query facet on a field."""
-        self.query_facets.append((self.backend.site.get_facet_field_name(field), query))
+        from haystack import connections
+        self.query_facets.append((connections[self._using].get_unified_index().get_facet_fieldname(field), query))
 
     def add_narrow_query(self, query):
         """
@@ -714,8 +778,9 @@ class BaseSearchQuery(object):
 
     def post_process_facets(self, results):
         # Handle renaming the facet fields. Undecorate and all that.
+        from haystack import connections
         revised_facets = {}
-        field_data = self.backend.site.all_searchfields()
+        field_data = connections[self._using].get_unified_index().all_searchfields()
 
         for facet_type, field_details in results.get('facets', {}).items():
             temp_facets = {}
@@ -731,6 +796,15 @@ class BaseSearchQuery(object):
 
         return revised_facets
 
+    def using(self, using=None):
+        """
+        Allows for overriding which connection should be used. This
+        disables the use of routers when performing the query.
+
+        If ``None`` is provided, it has no effect on what backend is used.
+        """
+        return self._clone(using=using)
+
     def _reset(self):
         """
         Resets the instance's internal state to appear as though no query has
@@ -741,24 +815,68 @@ class BaseSearchQuery(object):
         self._facet_counts = None
         self._spelling_suggestion = None
 
-    def _clone(self, klass=None):
+    def _clone(self, klass=None, using=None):
+        if using is None:
+            using = self._using
+        else:
+            from haystack import connections
+            klass = connections[using].query
+
         if klass is None:
             klass = self.__class__
 
-        clone = klass()
+        clone = klass(using=using)
         clone.query_filter = deepcopy(self.query_filter)
         clone.order_by = self.order_by[:]
         clone.models = self.models.copy()
         clone.boost = self.boost.copy()
         clone.highlight = self.highlight
         clone.facets = self.facets.copy()
+        clone.facet_options = self.facet_options.copy()
         clone.date_facets = self.date_facets.copy()
         clone.query_facets = self.query_facets[:]
         clone.narrow_queries = self.narrow_queries.copy()
         clone.start_offset = self.start_offset
         clone.end_offset = self.end_offset
-        clone.backend = self.backend
         clone.result_class = self.result_class
+        clone.within = self.within.copy()
+        clone.dwithin = self.dwithin.copy()
+        clone.distance_point = self.distance_point.copy()
         clone._raw_query = self._raw_query
         clone._raw_query_params = self._raw_query_params
+        clone._more_like_this = self._more_like_this
+        clone._mlt_instance = self._mlt_instance
         return clone
+
+
+class BaseEngine(object):
+    backend = BaseSearchBackend
+    query = BaseSearchQuery
+    unified_index = UnifiedIndex
+
+    def __init__(self, using=None):
+        if using is None:
+            using = DEFAULT_ALIAS
+
+        self.using = using
+        self.options = settings.HAYSTACK_CONNECTIONS.get(self.using, {})
+        self.queries = []
+        self._index = None
+        self._backend = None
+
+    def get_backend(self):
+        if self._backend is None:
+            self._backend = self.backend(self.using, **self.options)
+        return self._backend
+
+    def get_query(self):
+        return self.query(using=self.using)
+
+    def reset_queries(self):
+        self.queries = []
+
+    def get_unified_index(self):
+        if self._index is None:
+            self._index = self.unified_index(self.options.get('EXCLUDED_INDEXES', []))
+
+        return self._index

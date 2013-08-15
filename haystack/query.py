@@ -1,9 +1,11 @@
-import logging
 import operator
 import warnings
+from haystack import connections, connection_router
 from haystack.backends import SQ
 from haystack.constants import REPR_OUTPUT_SIZE, ITERATOR_LOAD_PER_QUERY, DEFAULT_OPERATOR
-from haystack.exceptions import NotRegistered
+from haystack.exceptions import NotHandled
+from haystack.inputs import Raw, Clean, AutoQuery
+from haystack.utils import log as logging
 
 
 class SearchQuerySet(object):
@@ -12,12 +14,17 @@ class SearchQuerySet(object):
 
     Supports chaining (a la QuerySet) to narrow the search.
     """
-    def __init__(self, site=None, query=None):
+    def __init__(self, using=None, query=None):
+        # ``_using`` should only ever be a value other than ``None`` if it's
+        # been forced with the ``.using`` method.
+        self._using = using
+        self.query = None
+        self._determine_backend()
+
+        # If ``query`` is present, it should override even what the routers
+        # think.
         if query is not None:
             self.query = query
-        else:
-            from haystack import backend
-            self.query = backend.SearchQuery(site=site)
 
         self._result_cache = []
         self._result_count = None
@@ -26,11 +33,30 @@ class SearchQuerySet(object):
         self._ignored_result_count = 0
         self.log = logging.getLogger('haystack')
 
-        if site is not None:
-            self.site = site
+    def _determine_backend(self):
+        # A backend has been manually selected. Use it instead.
+        if self._using is not None:
+            return self._using
+
+        # No backend, so rely on the routers to figure out what's right.
+        from haystack import connections
+        hints = {}
+
+        if self.query:
+            hints['models'] = self.query.models
+
+        backend_alias = connection_router.for_read(**hints)
+
+        if isinstance(backend_alias, (list, tuple)) and len(backend_alias):
+            # We can only effectively read from one engine.
+            backend_alias = backend_alias[0]
+
+        # The ``SearchQuery`` might swap itself out for a different variant
+        # here.
+        if self.query:
+            self.query = self.query.using(backend_alias)
         else:
-            from haystack import site as main_site
-            self.site = main_site
+            self.query = connections[backend_alias].get_query()
 
     def __getstate__(self):
         """
@@ -39,17 +65,14 @@ class SearchQuerySet(object):
         len(self)
         obj_dict = self.__dict__.copy()
         obj_dict['_iter'] = None
-        del obj_dict['site']
         obj_dict['log'] = None
         return obj_dict
 
-    def __setstate__(self, dict):
+    def __setstate__(self, data_dict):
         """
         For unpickling.
         """
-        self.__dict__ = dict
-        from haystack import site as main_site
-        self.site = main_site
+        self.__dict__ = data_dict
         self.log = logging.getLogger('haystack')
 
     def __repr__(self):
@@ -180,9 +203,12 @@ class SearchQuerySet(object):
             # Load the objects for each model in turn.
             for model in models_pks:
                 try:
-                    loaded_objects[model] = self.site.get_index(model).read_queryset().in_bulk(models_pks[model])
-                except NotRegistered:
-                    self.log.warning("Model not registered with search site '%s.%s'." % (self.app_label, self.model_name))
+                    ui = connections[self.query._using].get_unified_index()
+                    index = ui.get_index(model)
+                    objects = index.read_queryset(using=self.query._using)
+                    loaded_objects[model] = objects.in_bulk(models_pks[model])
+                except NotHandled:
+                    self.log.warning("Model '%s.%s' not handled by the routers.", self.app_label, self.model_name)
                     # Revert to old behaviour
                     loaded_objects[model] = model._default_manager.in_bulk(models_pks[model])
 
@@ -190,13 +216,11 @@ class SearchQuerySet(object):
             if self._load_all:
                 # We have to deal with integer keys being cast from strings
                 model_objects = loaded_objects.get(result.model, {})
-
                 if not result.pk in model_objects:
                     try:
                         result.pk = int(result.pk)
                     except ValueError:
                         pass
-
                 try:
                     result._object = model_objects[result.pk]
                 except KeyError:
@@ -249,15 +273,13 @@ class SearchQuerySet(object):
         else:
             return self._result_cache[start]
 
-
     # Methods that return a SearchQuerySet.
-
     def all(self):
         """Returns all results for the query."""
         return self._clone()
 
     def none(self):
-        """Returns all results for the query."""
+        """Returns an empty result list for the query."""
         return self._clone(klass=EmptySearchQuerySet)
 
     def filter(self, *args, **kwargs):
@@ -294,6 +316,12 @@ class SearchQuerySet(object):
 
         return clone
 
+    def order_by_distance(self, **kwargs):
+        """Alters the order in which the results should appear."""
+        clone = self._clone()
+        clone.query.add_order_by_distance(**kwargs)
+        return clone
+
     def highlight(self):
         """Adds highlighting to the results."""
         clone = self._clone()
@@ -305,7 +333,7 @@ class SearchQuerySet(object):
         clone = self._clone()
 
         for model in models:
-            if not model in self.site.get_indexed_models():
+            if not model in connections[self.query._using].get_unified_index().get_indexed_models():
                 warnings.warn('The model %r is not registered for search.' % model)
 
             clone.query.add_model(model)
@@ -329,10 +357,31 @@ class SearchQuerySet(object):
         clone.query.add_boost(term, boost)
         return clone
 
-    def facet(self, field):
+    def facet(self, field, prefix=None, limit=None, offset=None, sort=None, min_count=None, missing=None, uniques=False):
         """Adds faceting to a query for the provided field."""
         clone = self._clone()
-        clone.query.add_field_facet(field)
+        clone.query.add_field_facet(field, { "prefix": prefix, "limit": limit, "offset": offset, "sort": sort, "min_count": min_count, "missing": missing, "uniques": uniques })
+        return clone
+
+    def within(self, field, point_1, point_2):
+        """Spatial: Adds a bounding box search to the query."""
+        clone = self._clone()
+        clone.query.add_within(field, point_1, point_2)
+        return clone
+
+    def dwithin(self, field, point, distance):
+        """Spatial: Adds a distance-based search to the query."""
+        clone = self._clone()
+        clone.query.add_dwithin(field, point, distance)
+        return clone
+
+    def distance(self, field, point):
+        """
+        Spatial: Denotes results must have distance measurements from the
+        provided point.
+        """
+        clone = self._clone()
+        clone.query.add_distance(field, point)
         return clone
 
     def date_facet(self, field, start_date, end_date, gap_by, gap_amount=1):
@@ -355,9 +404,7 @@ class SearchQuerySet(object):
 
     def raw_search(self, query_string, **kwargs):
         """Passes a raw query directly to the backend."""
-        clone = self._clone()
-        clone.query.raw_search(query_string, **kwargs)
-        return clone
+        return self.filter(content=Raw(query_string, **kwargs))
 
     def load_all(self):
         """Efficiently populates the objects in the search results."""
@@ -365,51 +412,17 @@ class SearchQuerySet(object):
         clone._load_all = True
         return clone
 
-    def auto_query(self, query_string):
+    def auto_query(self, query_string, fieldname='content'):
         """
         Performs a best guess constructing the search query.
 
         This method is somewhat naive but works well enough for the simple,
         common cases.
         """
-        clone = self._clone()
-
-        # Pull out anything wrapped in quotes and do an exact match on it.
-        open_quote_position = None
-        non_exact_query = query_string
-
-        for offset, char in enumerate(query_string):
-            if char == '"':
-                if open_quote_position != None:
-                    current_match = non_exact_query[open_quote_position + 1:offset]
-
-                    if current_match:
-                        clone = clone.filter(content=clone.query.clean(current_match))
-
-                    non_exact_query = non_exact_query.replace('"%s"' % current_match, '', 1)
-                    open_quote_position = None
-                else:
-                    open_quote_position = offset
-
-        # Pseudo-tokenize the rest of the query.
-        keywords = non_exact_query.split()
-
-        # Loop through keywords and add filters to the query.
-        for keyword in keywords:
-            exclude = False
-
-            if keyword.startswith('-') and len(keyword) > 1:
-                keyword = keyword[1:]
-                exclude = True
-
-            cleaned_keyword = clone.query.clean(keyword)
-
-            if exclude:
-                clone = clone.exclude(content=cleaned_keyword)
-            else:
-                clone = clone.filter(content=cleaned_keyword)
-
-        return clone
+        kwargs = {
+            fieldname: AutoQuery(query_string)
+        }
+        return self.filter(**kwargs)
 
     def autocomplete(self, **kwargs):
         """
@@ -430,6 +443,16 @@ class SearchQuerySet(object):
                 query_bits.append(SQ(**kwargs))
 
         return clone.filter(reduce(operator.__and__, query_bits))
+
+    def using(self, connection_name):
+        """
+        Allows switching which connection the ``SearchQuerySet`` uses to
+        search in.
+        """
+        clone = self._clone()
+        clone.query = self.query.using(connection_name)
+        clone._using = connection_name
+        return clone
 
     # Methods that do not return a SearchQuerySet.
 
@@ -471,8 +494,8 @@ class SearchQuerySet(object):
         """
         Returns the spelling suggestion found by the query.
 
-        To work, you must set ``settings.HAYSTACK_INCLUDE_SPELLING`` to True.
-        Otherwise, ``None`` will be returned.
+        To work, you must set ``INCLUDE_SPELLING`` within your connection's
+        settings dictionary to ``True``. Otherwise, ``None`` will be returned.
 
         This will cause the query to execute and should generally be used when
         presenting the data.
@@ -518,7 +541,7 @@ class SearchQuerySet(object):
             klass = self.__class__
 
         query = self.query._clone()
-        clone = klass(site=self.site, query=query)
+        clone = klass(query=query)
         clone._load_all = self._load_all
         return clone
 
@@ -686,12 +709,12 @@ class RelatedSearchQuerySet(SearchQuerySet):
                 else:
                     # Check the SearchIndex for the model for an override.
                     try:
-                        index = self.site.get_index(model)
+                        index = connections[self.query._using].get_unified_index().get_index(model)
                         qs = index.load_all_queryset()
                         loaded_objects[model] = qs.in_bulk(models_pks[model])
-                    except NotRegistered:
-                        # The model returned doesn't seem to be registered with
-                        # the current site. We should silently fail and populate
+                    except NotHandled:
+                        # The model returned doesn't seem to be handled by the
+                        # routers. We should silently fail and populate
                         # nothing for those objects.
                         loaded_objects[model] = []
 
@@ -777,7 +800,7 @@ class RelatedSearchQuerySet(SearchQuerySet):
             klass = self.__class__
 
         query = self.query._clone()
-        clone = klass(site=self.site, query=query)
+        clone = klass(query=query)
         clone._load_all = self._load_all
         clone._load_all_querysets = self._load_all_querysets
         return clone

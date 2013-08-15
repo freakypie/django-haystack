@@ -6,7 +6,7 @@ from django.shortcuts import render_to_response
 from django import template
 from django.utils.encoding import force_unicode
 from django.utils.translation import ungettext
-from haystack import site
+from haystack import connections
 from haystack.query import SearchQuerySet
 try:
     from django.contrib.admin.options import csrf_protect_m
@@ -80,7 +80,7 @@ class SearchModelAdmin(ModelAdmin):
 
         # Do a search of just this model and populate a Changelist with the
         # returned bits.
-        if not self.model in site.get_indexed_models():
+        if not self.model in connections['default'].get_unified_index().get_indexed_models():
             # Oops. That model isn't being indexed. Return the usual
             # behavior instead.
             return super(SearchModelAdmin, self).changelist_view(request, extra_context)
@@ -89,7 +89,25 @@ class SearchModelAdmin(ModelAdmin):
         # Why copy-paste a few lines when you can copy-paste TONS of lines?
         list_display = list(self.list_display)
 
-        changelist = SearchChangeList(request, self.model, list_display, self.list_display_links, self.list_filter, self.date_hierarchy, self.search_fields, self.list_select_related, self.list_per_page, self.list_editable, self)
+        kwargs = {
+            'request': request,
+            'model': self.model,
+            'list_display': list_display,
+            'list_display_links': self.list_display_links,
+            'list_filter': self.list_filter,
+            'date_hierarchy': self.date_hierarchy,
+            'search_fields': self.search_fields,
+            'list_select_related': self.list_select_related,
+            'list_per_page': self.list_per_page,
+            'list_editable': self.list_editable,
+            'model_admin': self
+        }
+
+        # Django 1.4 compatibility.
+        if hasattr(self, 'list_max_show_all'):
+            kwargs['list_max_show_all'] = self.list_max_show_all
+
+        changelist = SearchChangeList(**kwargs)
         formset = changelist.formset = None
         media = self.media
 
@@ -116,7 +134,8 @@ class SearchModelAdmin(ModelAdmin):
             'cl': changelist,
             'media': media,
             'has_add_permission': self.has_add_permission(request),
-            'root_path': self.admin_site.root_path,
+            # More Django 1.4 compatibility
+            'root_path': getattr(self.admin_site, 'root_path', None),
             'app_label': self.model._meta.app_label,
             'action_form': action_form,
             'actions_on_top': self.actions_on_top,
