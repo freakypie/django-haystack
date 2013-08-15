@@ -4,7 +4,7 @@
 ``SearchQuery`` API
 ===================
 
-.. class:: SearchQuery(backend=None)
+.. class:: SearchQuery(using=DEFAULT_ALIAS)
 
 The ``SearchQuery`` class acts as an intermediary between ``SearchQuerySet``'s
 abstraction and ``SearchBackend``'s actual search. Given the metadata provided
@@ -21,8 +21,8 @@ interface to work with.
 
 Should you need advanced/custom behavior, you can supply your version of
 ``SearchQuery`` that overrides/extends the class in the manner you see fit.
-``SearchQuerySet`` objects take a kwarg parameter ``query`` where you can pass
-in your class.
+You can either hook it up in a ``BaseEngine`` subclass or ``SearchQuerySet``
+objects take a kwarg parameter ``query`` where you can pass in your class.
 
 
 ``SQ`` Objects
@@ -250,6 +250,12 @@ to the rest of the ``SearchQuerySet``.
 Allows backends with support for "More Like This" to return results
 similar to the provided instance.
 
+``add_stats_query``
+~~~~~~~~~~~~~~~~~~~
+.. method:: SearchQuery.add_stats_query(self,stats_field,stats_facets)
+
+Adds stats and stats_facets queries for the Solr backend.
+
 ``add_highlight``
 ~~~~~~~~~~~~~~~~~
 
@@ -257,10 +263,32 @@ similar to the provided instance.
 
 Adds highlighting to the search results.
 
+``add_within``
+~~~~~~~~~~~~~~
+
+.. method:: SearchQuery.add_within(self, field, point_1, point_2):
+
+Adds bounding box parameters to search query.
+
+``add_dwithin``
+~~~~~~~~~~~~~~~
+
+.. method:: SearchQuery.add_dwithin(self, field, point, distance):
+
+Adds radius-based parameters to search query.
+
+``add_distance``
+~~~~~~~~~~~~~~~~
+
+.. method:: SearchQuery.add_distance(self, field, point):
+
+Denotes that results should include distance measurements from the
+point passed in.
+
 ``add_field_facet``
 ~~~~~~~~~~~~~~~~~~~
 
-.. method:: SearchQuery.add_field_facet(self, field)
+.. method:: SearchQuery.add_field_facet(self, field, **options)
 
 Adds a regular facet on a field.
 
@@ -296,3 +324,13 @@ Sets the result class to use for results.
 
 Overrides any previous usages. If ``None`` is provided, Haystack will
 revert back to the default ``SearchResult`` object.
+
+``using``
+~~~~~~~~~
+
+.. method:: SearchQuery.using(self, using=None)
+
+Allows for overriding which connection should be used. This
+disables the use of routers when performing the query.
+
+If ``None`` is provided, it has no effect on what backend is used.

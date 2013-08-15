@@ -32,6 +32,7 @@ Included with Haystack are the following field types:
 * ``EdgeNgramField``
 * ``FloatField``
 * ``IntegerField``
+* ``LocationField``
 * ``MultiValueField``
 * ``NgramField``
 
@@ -61,13 +62,17 @@ within a ``SearchIndex``. You use them in a declarative manner, just like
 fields in ``django.forms.Form`` or ``django.db.models.Model`` objects. For
 example::
 
-    from haystack.indexes import *
-    
-    
-    class NoteIndex(SearchIndex):
-        text = CharField(document=True, use_template=True)
-        author = CharField(model_attr='user')
-        pub_date = DateTimeField(model_attr='pub_date')
+    from haystack import indexes
+    from myapp.models import Note
+
+
+    class NoteIndex(indexes.SearchIndex, indexes.Indexable):
+        text = indexes.CharField(document=True, use_template=True)
+        author = indexes.CharField(model_attr='user')
+        pub_date = indexes.DateTimeField(model_attr='pub_date')
+
+        def get_model(self):
+            return Note
 
 This will hook up those fields with the index and, when updating a ``Model``
 object, pull the relevant data out and prepare it for storage in the index.

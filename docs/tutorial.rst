@@ -27,8 +27,14 @@ which ever search engine you choose.
     If you hit a stumbling block, there is both a `mailing list`_ and
     `#haystack on irc.freenode.net`_ to get help.
 
+.. note::
+
+   You can participate in and/or track the development of Haystack by
+   subscribing to the `development mailing list`_.
+
 .. _mailing list: http://groups.google.com/group/django-haystack
 .. _#haystack on irc.freenode.net: irc://irc.freenode.net/haystack
+.. _development mailing list: http://groups.google.com/group/django-haystack-dev
 
 This tutorial assumes that you have a basic familiarity with the various major
 parts of Django (models/forms/views/settings/URLconfs) and tailored to the
@@ -90,50 +96,54 @@ Within your ``settings.py``, you'll need to add a setting to indicate where your
 site configuration file will live and which backend to use, as well as other
 settings for that backend.
 
-``HAYSTACK_SITECONF`` is a required settings and should provide a Python import
-path to a file where you keep your ``SearchSite`` configurations in. This will
-be explained in the next step, but for now, add the following settings
-(substituting your correct information) and create an empty file at that path::
-
-    HAYSTACK_SITECONF = 'myproject.search_sites'
-
-``HAYSTACK_SEARCH_ENGINE`` is a required setting and should be one of the
-following:
-
-* ``solr``
-* ``whoosh``
-* ``xapian`` (if you installed ``xapian-haystack``)
-* ``simple``
-* ``dummy``
-
-Example::
-
-    HAYSTACK_SEARCH_ENGINE = 'whoosh'
-
-Additionally, backends may require additional information.
+``HAYSTACK_CONNECTIONS`` is a required setting and should be at least one of
+the following:
 
 Solr
 ~~~~
 
-Requires setting ``HAYSTACK_SOLR_URL`` to be the URL where your Solr is running at.
+Example::
+
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.solr_backend.SolrEngine',
+            'URL': 'http://127.0.0.1:8983/solr'
+            # ...or for multicore...
+            # 'URL': 'http://127.0.0.1:8983/solr/mysite',
+        },
+    }
+
+
+Elasticsearch
+~~~~~~~~~~~~~
 
 Example::
 
-    HAYSTACK_SOLR_URL = 'http://127.0.0.1:8983/solr'
-    # ...or for multicore...
-    HAYSTACK_SOLR_URL = 'http://127.0.0.1:8983/solr/mysite'
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.elasticsearch_backend.ElasticsearchSearchEngine',
+            'URL': 'http://127.0.0.1:9200/',
+            'INDEX_NAME': 'haystack',
+        },
+    }
 
 
 Whoosh
 ~~~~~~
 
-Requires setting ``HAYSTACK_WHOOSH_PATH`` to the place on your filesystem where the
+Requires setting ``PATH`` to the place on your filesystem where the
 Whoosh index should be located. Standard warnings about permissions and keeping
 it out of a place your webserver may serve documents out of apply.
 
 Example::
 
-    HAYSTACK_WHOOSH_PATH = '/home/whoosh/mysite_index'
+    import os
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.whoosh_backend.WhooshEngine',
+            'PATH': os.path.join(os.path.dirname(__file__), 'whoosh_index'),
+        },
+    }
 
 
 Xapian
@@ -143,41 +153,41 @@ First, install the Xapian backend (via
 http://github.com/notanumber/xapian-haystack/tree/master) per the instructions
 included with the backend.
 
-Requires setting ``HAYSTACK_XAPIAN_PATH`` to the place on your filesystem where the
+Requires setting ``PATH`` to the place on your filesystem where the
 Xapian index should be located. Standard warnings about permissions and keeping
 it out of a place your webserver may serve documents out of apply.
 
 Example::
 
-    HAYSTACK_XAPIAN_PATH = '/home/xapian/mysite_index'
+    import os
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.xapian_backend.XapianEngine',
+            'PATH': os.path.join(os.path.dirname(__file__), 'xapian_index'),
+        },
+    }
 
 
 Simple
 ~~~~~~
 
 The ``simple`` backend using very basic matching via the database itself. It's
-not recommended for production use but is more useful than the ``dummy`` backend
-in that it will return results. No extra settings are needed.
+not recommended for production use but it will return results.
 
+.. warning::
 
-Create A ``SearchSite``
------------------------
+    This backend does *NOT* work like the other backends do. Data preparation
+    does nothing & advanced filtering calls do not work. You really probably
+    don't want this unless you're in an environment where you just want to
+    silence Haystack.
 
-Within the empty file you created corresponding to your ``HAYSTACK_SITECONF``,
-add the following code::
+Example::
 
-    import haystack
-    haystack.autodiscover()
-
-This will create a default ``SearchSite`` instance, search through all of your
-INSTALLED_APPS for ``search_indexes.py`` and register all ``SearchIndex``
-classes with the default ``SearchSite``.
-
-.. note::
-
-    You can configure more than one ``SearchSite`` as well as manually
-    registering/unregistering indexes with them. However, these are rarely done
-    in practice and are available for advanced use.
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.simple_backend.SimpleEngine',
+        },
+    }
 
 
 Handling Data
@@ -195,37 +205,31 @@ You generally create a unique ``SearchIndex`` for each type of ``Model`` you
 wish to index, though you can reuse the same ``SearchIndex`` between different
 models if you take care in doing so and your field names are very standardized.
 
-To use a ``SearchIndex``, you need to register it with the ``Model`` it applies
-to and the ``SearchSite`` it ought to belong to. Registering indexes in Haystack
-is very similar to the way you register models and ``ModelAdmin`` classes with
-the `Django admin site`_.
-
-To build a ``SearchIndex``, all that's necessary is to subclass ``SearchIndex``,
-define the fields you want to store data with and register it.
+To build a ``SearchIndex``, all that's necessary is to subclass both
+``indexes.SearchIndex`` & ``indexes.Indexable``,
+define the fields you want to store data with and define a ``get_model`` method.
 
 We'll create the following ``NoteIndex`` to correspond to our ``Note``
 model. This code generally goes in a ``search_indexes.py`` file within the app
 it applies to, though that is not required. This allows
-``haystack.autodiscover()`` to automatically pick it up. The
-``NoteIndex`` should look like::
+Haystack to automatically pick it up. The ``NoteIndex`` should look like::
 
     import datetime
-    from haystack.indexes import *
-    from haystack import site
+    from haystack import indexes
     from myapp.models import Note
 
 
-    class NoteIndex(SearchIndex):
-        text = CharField(document=True, use_template=True)
-        author = CharField(model_attr='user')
-        pub_date = DateTimeField(model_attr='pub_date')
+    class NoteIndex(indexes.SearchIndex, indexes.Indexable):
+        text = indexes.CharField(document=True, use_template=True)
+        author = indexes.CharField(model_attr='user')
+        pub_date = indexes.DateTimeField(model_attr='pub_date')
 
-        def index_queryset(self):
+        def get_model(self):
+            return Note
+
+        def index_queryset(self, using=None):
             """Used when the entire index for model is updated."""
-            return Note.objects.filter(pub_date__lte=datetime.datetime.now())
-
-
-    site.register(Note, NoteIndex)
+            return self.get_model().objects.filter(pub_date__lte=datetime.datetime.now())
 
 Every ``SearchIndex`` requires there be one (and only one) field with
 ``document=True``. This indicates to both Haystack and the search engine about
@@ -362,7 +366,7 @@ models were processed and placed in the index.
     things to update).
 
     Alternatively, if you have low traffic and/or your search engine can handle
-    it, the ``RealTimeSearchIndex`` automatically handles updates/deletes
+    it, the ``RealtimeSignalProcessor`` automatically handles updates/deletes
     for you.
 
 
